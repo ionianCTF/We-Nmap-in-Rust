@@ -24,6 +24,7 @@ fn main() {
         "--interfaces" | "-i" => cmd_interfaces(),
         "--scan" | "-s" => cmd_scan(&args[2..]),
         "--pcap" | "-p" => cmd_pcap(&args[2..]),
+        "--route" | "-r" => cmd_route(&args[2..]),
         "--version" | "-V" => {
             println!("WNR (We Nmap in Rust) {}", env!("CARGO_PKG_VERSION"))
         }
@@ -43,6 +44,7 @@ fn print_usage() {
          \x20 wnr --interfaces                 enumerate network interfaces\n\
          \x20 wnr --scan <host> [-p PORT[,RANGE]...] [--timeout MS]\n\
          \x20 wnr --pcap <file> [--filter EXPR]\n\
+         \x20 wnr --route <host>               show the route/next-hop to a host\n\
          \x20 wnr --version\n",
         env!("CARGO_PKG_VERSION")
     );
@@ -223,6 +225,45 @@ fn cmd_pcap(args: &[String]) {
     }
 }
 
+fn cmd_route(args: &[String]) {
+    let host = args.iter().find(|a| !a.starts_with('-'));
+    let Some(host) = host else {
+        eprintln!("no host specified");
+        return;
+    };
+    let Some(ip) = resolve_ip(host) else {
+        eprintln!("could not resolve host '{}'", host);
+        return;
+    };
+    let dst = match ip {
+        std::net::IpAddr::V4(v4) => wnr_dnet::Addr::ipv4(v4),
+        std::net::IpAddr::V6(v6) => wnr_dnet::Addr::ipv6(v6),
+    };
+    match wnr_dnet::route::route_to(&dst) {
+        Some((ifname, src)) => {
+            println!(
+                "route to {} ({}) -> via interface '{}' with source {}",
+                host, ip, ifname, src
+            );
+        }
+        None => {
+            println!("no route to {} ({})", host, ip);
+        }
+    }
+}
+
+/// Resolve a hostname (or literal IP) to an [`std::net::IpAddr`].
+fn resolve_ip(host: &str) -> Option<std::net::IpAddr> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    (host, 0)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .map(|sa| sa.ip())
+}
+
 fn parse_ports(spec: &str) -> Vec<u16> {
     let mut out = Vec::new();
     for part in spec.split(',') {
@@ -238,4 +279,35 @@ fn parse_ports(spec: &str) -> Vec<u16> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_ports() {
+        assert_eq!(parse_ports("80"), vec![80]);
+        assert_eq!(parse_ports("80,443,22"), vec![80, 443, 22]);
+    }
+
+    #[test]
+    fn parse_ranges() {
+        assert_eq!(parse_ports("1000-1002"), vec![1000, 1001, 1002]);
+        assert_eq!(parse_ports("1-3,80"), vec![1, 2, 3, 80]);
+    }
+
+    #[test]
+    fn parse_single_is_treated_as_range_of_one() {
+        assert_eq!(parse_ports("5-5"), vec![5]);
+    }
+
+    #[test]
+    fn resolve_ip_literal() {
+        assert_eq!(
+            resolve_ip("127.0.0.1"),
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        assert!(resolve_ip("not-a-real-host.invalid").is_none());
+    }
 }
