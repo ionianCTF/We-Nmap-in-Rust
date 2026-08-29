@@ -367,9 +367,9 @@ fn unix_interfaces() -> Vec<IntfEntry> {
                     }
                 }
 
-                if family == libc::AF_PACKET || family == libc::AF_LINK {
-                    #[cfg(target_os = "linux")]
-                    {
+                #[cfg(target_os = "linux")]
+                {
+                    if family == libc::AF_PACKET {
                         let sa = &*(ifa.ifa_addr as *const libc::sockaddr_ll);
                         if sa.sll_halen == 6 {
                             let mut mac = [0u8; 6];
@@ -377,12 +377,14 @@ fn unix_interfaces() -> Vec<IntfEntry> {
                             entry.link_addr = Addr::hw(mac);
                         }
                     }
-                    #[cfg(target_os = "macos")]
-                    {
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    if family == libc::AF_LINK {
                         let sa = &*(ifa.ifa_addr as *const libc::sockaddr_dl);
                         if sa.sdl_alen == 6 {
                             let base = ifa.ifa_addr as *const u8;
-                            let off = sa.sdl_nlen;
+                            let off = sa.sdl_nlen as usize;
                             let mut mac = [0u8; 6];
                             std::ptr::copy_nonoverlapping(base.add(off), mac.as_mut_ptr(), 6);
                             entry.link_addr = Addr::hw(mac);

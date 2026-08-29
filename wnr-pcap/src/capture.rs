@@ -17,7 +17,34 @@
 use std::path::Path;
 
 use crate::datalink;
+use crate::raw::Direction;
 use crate::savefile::{SavefileReader, SavefileWriter};
+
+/// The version string reported by this library, mirroring `pcap_lib_version`.
+pub fn lib_version() -> &'static str {
+    concat!("wnr-pcap ", env!("CARGO_PKG_VERSION"))
+}
+
+/// Capture statistics, mirroring `struct pcap_stat`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureStats {
+    /// Packets received (for captures that support it).
+    pub ps_recv: u32,
+    /// Packets dropped because there was no room in the operating system's
+    /// buffer (for captures that support it).
+    pub ps_drop: u32,
+    /// Packets dropped by the network interface (for captures that support it).
+    pub ps_ifdrop: u32,
+}
+
+/// Return value a `Capture::loop_` callback can use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopControl {
+    /// Keep processing packets.
+    Continue,
+    /// Stop processing (as if `pcap_breakloop` was called).
+    Break,
+}
 
 /// A snapshot of a captured packet with metadata, mirroring
 /// `struct pcap_pkthdr` plus the captured bytes.
@@ -42,6 +69,12 @@ pub struct Capture {
     filter: Option<crate::bpf::BpfProgram>,
     // Reused interpreter for applying `filter` across frames.
     filter_vm: crate::bpf::BpfVm,
+    /// Packet direction filter (live captures only).
+    direction: Direction,
+    /// Non-blocking read mode (live captures only).
+    nonblock: bool,
+    /// Most recent error message, mirroring `pcap_geterr`.
+    last_err: String,
 }
 
 enum CaptureKind {
@@ -119,6 +152,9 @@ impl Capture {
                 linktype: datalink::DLT_EN10MB,
                 filter: None,
                 filter_vm: crate::bpf::BpfVm::new(),
+                direction: Direction::InOut,
+                nonblock: false,
+                last_err: String::new(),
             })
         }
         #[cfg(windows)]
@@ -132,6 +168,9 @@ impl Capture {
                 linktype: datalink::DLT_RAW,
                 filter: None,
                 filter_vm: crate::bpf::BpfVm::new(),
+                direction: Direction::InOut,
+                nonblock: false,
+                last_err: String::new(),
             })
         }
         #[cfg(not(any(unix, windows)))]
@@ -156,12 +195,18 @@ impl Capture {
             linktype,
             filter: None,
             filter_vm: crate::bpf::BpfVm::new(),
+            direction: Direction::InOut,
+            nonblock: false,
+            last_err: String::new(),
         })
     }
 
     /// Set a BPF filter, mirroring `pcap_setfilter` / `pcap_compile`.
     pub fn set_filter(&mut self, expr: &str) -> Result<(), String> {
-        let prog = crate::bpf::FilterBuilder::compile(expr, self.linktype)?;
+        let prog = crate::bpf::FilterBuilder::compile(expr, self.linktype).map_err(|e| {
+            self.last_err = format!("syntax error: {}", e);
+            e
+        })?;
         self.filter = Some(prog);
         self.filter_vm = crate::bpf::BpfVm::new();
         Ok(())
@@ -216,6 +261,119 @@ impl Capture {
         w.flush()?;
         Ok(count)
     }
+
+    /// The most recent error message, mirroring `pcap_geterr`.
+    pub fn geterr(&self) -> &str {
+        &self.last_err
+    }
+
+    /// Human-readable name for this capture's datalink type, mirroring
+    /// `pcap_datalink_val_to_name`.
+    pub fn datalink_val_to_name(&self) -> &'static str {
+        datalink::datalink_ntop(self.linktype)
+    }
+
+    /// Is this capture in non-blocking mode? Mirrors `pcap_getnonblock`.
+    pub fn nonblock(&self) -> bool {
+        self.nonblock
+    }
+
+    /// Set or clear non-blocking mode, mirroring `pcap_setnonblock`.
+    ///
+    /// The mode is stored and applied to the live backend; for offline
+    /// captures it is stored but has no effect on synchronous reads.
+    pub fn set_nonblock(&mut self, nb: bool) -> Result<(), String> {
+        match &mut self.kind {
+            CaptureKind::Offline(_) => {}
+            #[cfg(any(unix, windows))]
+            CaptureKind::Live(r) => {
+                r.set_nonblock(nb).map_err(|e| {
+                    self.last_err = e.to_string();
+                    format!("pcap_setnonblock: {}", e)
+                })?;
+            }
+        }
+        self.nonblock = nb;
+        Ok(())
+    }
+
+    /// Restrict capture to packets of a given direction, mirroring
+    /// `pcap_setdirection`.
+    pub fn set_direction(&mut self, dir: Direction) -> Result<(), String> {
+        match &mut self.kind {
+            CaptureKind::Offline(_) => {
+                self.last_err = "pcap_setdirection: cannot set direction on an offline capture"
+                    .to_string();
+                return Err(self.last_err.clone());
+            }
+            #[cfg(any(unix, windows))]
+            CaptureKind::Live(r) => r.set_direction(dir),
+        }
+        self.direction = dir;
+        Ok(())
+    }
+
+    /// Read capture statistics, mirroring `pcap_stats`.
+    pub fn stats(&self) -> CaptureStats {
+        let (recv, drop) = match &self.kind {
+            CaptureKind::Offline(_) => (0, 0),
+            #[cfg(any(unix, windows))]
+            CaptureKind::Live(r) => r.poll_stats().unwrap_or((0, 0)),
+        };
+        CaptureStats {
+            ps_recv: recv as u32,
+            ps_drop: drop as u32,
+            ps_ifdrop: 0,
+        }
+    }
+
+    /// Inject a raw frame onto the wire, mirroring `pcap_inject` /
+    /// `pcap_sendpacket`. Only supported on live captures. Returns the number
+    /// of bytes written.
+    pub fn inject(&mut self, data: &[u8]) -> Result<usize, String> {
+        match &mut self.kind {
+            CaptureKind::Offline(_) => {
+                self.last_err = "cannot inject on an offline capture".to_string();
+                return Err(self.last_err.clone());
+            }
+            #[cfg(any(unix, windows))]
+            CaptureKind::Live(r) => {
+                return r.send_frame(data).map_err(|e| {
+                    self.last_err = e.to_string();
+                    format!("pcap_inject: {}", e)
+                });
+            }
+        }
+    }
+
+    /// Process up to `count` packets from a live/offline capture, mirroring
+    /// `pcap_loop`. `count == 0` means "until break / end of capture".
+    /// Returns the number of packets processed.
+    pub fn loop_(
+        &mut self,
+        count: i32,
+        mut cb: impl FnMut(&PacketHeader, &[u8]) -> LoopControl,
+    ) -> Result<u32, String> {
+        // `count < 0` means "read forever" — treat like 0 per libpcap, but we
+        // allow only 0 as the "forever" sentinel to stay deterministic.
+        let limit = if count <= 0 { u32::MAX } else { count as u32 };
+        let mut processed = 0u32;
+        loop {
+            if processed >= limit {
+                return Ok(processed);
+            }
+            match self.next_packet() {
+                Ok(Some((hdr, data))) => {
+                    processed += 1;
+                    if cb(&hdr, &data) == LoopControl::Break {
+                        return Ok(processed);
+                    }
+                }
+                Ok(None) => return Ok(processed),
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 /// Load a capture file fully into memory for analysis.
@@ -237,4 +395,115 @@ pub fn strip_link_header(dlt: i32, frame: &[u8]) -> Option<(usize, usize, &[u8])
         return None;
     }
     Some((off, frame.len() - off, &frame[off..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datalink;
+    use crate::raw;
+    use crate::raw::Direction;
+    use crate::savefile::SavefileWriter;
+
+    /// Write a 4-packet savefile and return its path.
+    fn fixture() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("wnr_cap_{}.pcap", std::process::id()));
+        {
+            let mut w = SavefileWriter::create(&path, 65535, datalink::DLT_EN10MB as u32).unwrap();
+            for i in 0..4u32 {
+                w.write_packet(1000 + i, 0, &[i as u8; 8]).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn loop_reads_all_packets() {
+        let path = fixture();
+        let mut cap = Capture::open_offline(&path).unwrap();
+        let mut seen = Vec::new();
+        let n = cap
+            .loop_(0, |hdr, data| {
+                seen.push((hdr.ts_sec, data.len()));
+                LoopControl::Continue
+            })
+            .unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(seen, vec![(1000, 8), (1001, 8), (1002, 8), (1003, 8)]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loop_counts_exactly() {
+        let path = fixture();
+        let mut cap = Capture::open_offline(&path).unwrap();
+        let n = cap.loop_(2, |_, _| LoopControl::Continue).unwrap();
+        assert_eq!(n, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loop_break_stops_early() {
+        let path = fixture();
+        let mut cap = Capture::open_offline(&path).unwrap();
+        let mut count = 0;
+        let n = cap
+            .loop_(0, |_, _| {
+                count += 1;
+                if count == 3 {
+                    LoopControl::Break
+                } else {
+                    LoopControl::Continue
+                }
+            })
+            .unwrap();
+        assert_eq!(n, 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn misc_pcap_parity() {
+        let path = fixture();
+        let mut cap = Capture::open_offline(&path).unwrap();
+
+        // datalink name
+        assert_eq!(cap.datalink_val_to_name(), "EN10MB");
+        assert_eq!(cap.snaplen(), 65535);
+
+        // nonblock is stored without error on offline
+        cap.set_nonblock(true).unwrap();
+        assert!(cap.nonblock());
+
+        // inject / set_direction reject offline
+        assert!(cap.inject(&[0u8; 4]).is_err());
+        assert!(cap.set_direction(Direction::In).is_err());
+        assert!(!cap.geterr().is_empty());
+
+        // stats on offline are zeros
+        let s = cap.stats();
+        assert_eq!(s.ps_recv, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lib_version_present() {
+        assert!(lib_version().starts_with("wnr-pcap "));
+    }
+
+    #[test]
+    fn direction_matching() {
+        // inbound packet types admitted for In
+        assert!(raw::pkttype_matches_dir(raw::PKT_HOST, Direction::In));
+        assert!(raw::pkttype_matches_dir(raw::PKT_BROADCAST, Direction::In));
+        // outgoing excluded for In
+        assert!(!raw::pkttype_matches_dir(raw::PKT_OUTGOING, Direction::In));
+        // only outgoing for Out
+        assert!(raw::pkttype_matches_dir(raw::PKT_OUTGOING, Direction::Out));
+        assert!(!raw::pkttype_matches_dir(raw::PKT_HOST, Direction::Out));
+        // InOut admits everything
+        assert!(raw::pkttype_matches_dir(raw::PKT_OUTGOING, Direction::InOut));
+        assert!(raw::pkttype_matches_dir(raw::PKT_HOST, Direction::InOut));
+    }
 }

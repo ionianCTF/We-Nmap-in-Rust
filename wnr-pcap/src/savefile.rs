@@ -70,6 +70,9 @@ pub struct PcapPacket {
     pub caplen: u32,
     /// Original length on the wire.
     pub origlen: u32,
+    /// Packet direction / type hint (see [`crate::raw::pkttype`]). Zero on
+    /// captures (offline savefiles) that do not carry this information.
+    pub pkttype: u16,
     /// Frame data.
     pub data: Vec<u8>,
 }
@@ -174,6 +177,7 @@ impl SavefileReader {
             ts_frac,
             caplen,
             origlen,
+            pkttype: 0,
             data,
         }))
     }

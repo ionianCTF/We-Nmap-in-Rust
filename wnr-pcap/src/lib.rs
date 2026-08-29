@@ -34,4 +34,8 @@ pub mod datalink;
 pub mod raw;
 pub mod savefile;
 
-pub use capture::{Capture, Device, PacketHeader, findalldevs, lookupdev, read_all};
+pub use capture::{
+    Capture, CaptureStats, Device, LoopControl, PacketHeader, findalldevs, lib_version, lookupdev,
+    read_all,
+};
+pub use raw::Direction;

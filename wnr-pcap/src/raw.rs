@@ -7,16 +7,45 @@
 
 use std::io;
 
+/// Packet direction filter, mirroring libpcap's `PCAP_D_IN` / `PCAP_D_OUT` /
+/// `PCAP_D_INOUT` modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// Capture only packets sent to this host.
+    In,
+    /// Capture only packets sent by this host.
+    Out,
+    /// Capture packets travelling in both directions (default).
+    InOut,
+}
+
+/// Linux `sll_pkttype` values — mirrors `<linux/if_packet.h>`.
+pub const PKT_HOST: u16 = 0;
+pub const PKT_BROADCAST: u16 = 1;
+pub const PKT_MULTICAST: u16 = 2;
+pub const PKT_OTHERHOST: u16 = 3;
+pub const PKT_OUTGOING: u16 = 4;
+
+/// Whether a packet with type `pkttype` is admitted by `dir`.
+pub fn pkttype_matches_dir(pkttype: u16, dir: Direction) -> bool {
+    match dir {
+        Direction::In => pkttype != PKT_OUTGOING,
+        Direction::Out => pkttype == PKT_OUTGOING,
+        Direction::InOut => true,
+    }
+}
+
 /// A handle to a live raw packet socket.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
+#[cfg(target_os = "linux")]
 pub struct RawCapture {
     fd: i32,
-    snaplen: u32,
+    ifindex: i32,
+    direction: Direction,
     /// Reusable read buffer sized to snaplen.
     buf: Vec<u8>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
+#[cfg(target_os = "linux")]
 impl RawCapture {
     /// Open a raw socket on `device` and bind to it.
     pub fn open(
@@ -69,7 +98,8 @@ impl RawCapture {
             }
             Ok(RawCapture {
                 fd,
-                snaplen: snaplen.max(64),
+                ifindex: ifindex as i32,
+                direction: Direction::InOut,
                 buf: vec![0u8; snaplen.max(64) as usize],
             })
         }
@@ -85,35 +115,113 @@ impl RawCapture {
     }
 
     /// Read the next raw frame. Returns `Ok(None)` while no frame is ready
-    /// (i.e. the non-blocking read returned WouldBlock).
+    /// (i.e. the non-blocking read returned WouldBlock). Frames filtered out
+    /// by the configured [`Direction`] are skipped internally, so `Ok(None)`
+    /// always means "no matching frame ready yet".
     pub fn next_packet(&mut self) -> io::Result<Option<crate::savefile::PcapPacket>> {
-        let n = unsafe {
-            libc::recv(
+        loop {
+            let mut from: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            let mut fromlen = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            let n = unsafe {
+                libc::recvfrom(
+                    self.fd,
+                    self.buf.as_mut_ptr() as *mut libc::c_void,
+                    self.buf.len(),
+                    0,
+                    &mut from as *mut _ as *mut libc::sockaddr,
+                    &mut fromlen,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+            let n = n as usize;
+            let pkttype = from.sll_pkttype as u16;
+            if !pkttype_matches_dir(pkttype, self.direction) {
+                continue;
+            }
+            return Ok(Some(crate::savefile::PcapPacket {
+                ts_sec: 0,
+                ts_frac: 0,
+                caplen: n as u32,
+                origlen: n as u32,
+                pkttype,
+                data: self.buf[..n].to_vec(),
+            }));
+        }
+    }
+
+    /// Set the packet direction filter.
+    pub fn set_direction(&mut self, dir: Direction) {
+        self.direction = dir;
+    }
+
+    /// Toggle non-blocking mode.
+    pub fn set_nonblock(&mut self, nb: bool) -> io::Result<()> {
+        let fl = unsafe { libc::fcntl(self.fd, libc::F_GETFL) };
+        let new = if nb { fl | libc::O_NONBLOCK } else { fl & !libc::O_NONBLOCK };
+        if unsafe { libc::fcntl(self.fd, libc::F_SETFL, new) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Poll per-interface packet statistics (Linux `SO_PACKET_STATISTICS`).
+    /// Returns `(packets_received, packets_dropped)`.
+    pub fn poll_stats(&self) -> io::Result<(u64, u64)> {
+        let mut raw = [0u8; 64];
+        let mut len = raw.len() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
                 self.fd,
-                self.buf.as_mut_ptr() as *mut libc::c_void,
-                self.buf.len(),
+                libc::SOL_PACKET,
+                libc::PACKET_STATISTICS,
+                raw.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let packets = u32::from_ne_bytes(raw[0..4].try_into().unwrap_or([0; 4])) as u64;
+        let drops = u32::from_ne_bytes(raw[4..8].try_into().unwrap_or([0; 4])) as u64;
+        Ok((packets, drops))
+    }
+
+    /// Send a raw frame out of the bound interface, mirroring
+    /// `pcap_inject` / `pcap_sendpacket`. Returns bytes written.
+    pub fn send_frame(&self, data: &[u8]) -> io::Result<usize> {
+        let addr = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as u16,
+            sll_protocol: 0,
+            sll_ifindex: self.ifindex,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 0,
+            sll_addr: [0; 8],
+        };
+        let n = unsafe {
+            libc::sendto(
+                self.fd,
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
                 0,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
             )
         };
         if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock {
-                return Ok(None);
-            }
-            return Err(err);
+            return Err(io::Error::last_os_error());
         }
-        let n = n as usize;
-        Ok(Some(crate::savefile::PcapPacket {
-            ts_sec: 0,
-            ts_frac: 0,
-            caplen: n as u32,
-            origlen: n as u32,
-            data: self.buf[..n].to_vec(),
-        }))
+        Ok(n as usize)
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
+#[cfg(target_os = "linux")]
 impl Drop for RawCapture {
     fn drop(&mut self) {
         if self.fd >= 0 {
@@ -242,8 +350,37 @@ impl RawCapture {
             ts_frac: now.subsec_micros(),
             caplen: n as u32,
             origlen: n as u32,
+            pkttype: 0,
             data: self.buf[..n].to_vec(),
         }))
+    }
+
+    /// No-op on Windows; raw-socket capture delivers both directions.
+    pub fn set_direction(&mut self, _dir: Direction) {}
+
+    /// Toggle non-blocking mode via `FIONBIO`.
+    pub fn set_nonblock(&mut self, nb: bool) -> io::Result<()> {
+        use windows_sys::Win32::Networking::WinSock as ws;
+        let v: u32 = if nb { 1 } else { 0 };
+        let r = unsafe { ws::ioctlsocket(self.sock, ws::FIONBIO, &v as *const _ as *mut u32) };
+        if r == ws::SOCKET_ERROR {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// No statistics are exposed without the Npcap driver; return zeros.
+    pub fn poll_stats(&self) -> io::Result<(u64, u64)> {
+        Ok((0, 0))
+    }
+
+    /// The Windows raw-socket backend has no fixed destination to inject
+    /// toward, so injection is reported as unsupported.
+    pub fn send_frame(&self, _data: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "injection is unsupported on the raw-socket Windows backend",
+        ))
     }
 }
 
@@ -285,6 +422,58 @@ fn interface_ipv4(device: &str) -> Option<[u8; 4]> {
     None
 }
 
+/// BSD/macOS live capture via BPF devices is not yet implemented; a stub
+/// keeps `Capture` compiling on those platforms until the backend lands.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub struct RawCapture {
+    _private: (),
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl RawCapture {
+    pub fn open(
+        _device: &str,
+        _snaplen: u32,
+        _promisc: bool,
+        _timeout_ms: i32,
+    ) -> io::Result<RawCapture> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live raw capture not implemented on this platform",
+        ))
+    }
+
+    pub fn next_packet(&mut self) -> io::Result<Option<crate::savefile::PcapPacket>> {
+        Ok(None)
+    }
+
+    pub fn set_direction(&mut self, _dir: Direction) {}
+    pub fn set_nonblock(&mut self, _nb: bool) -> io::Result<()> {
+        Ok(())
+    }
+    pub fn poll_stats(&self) -> io::Result<(u64, u64)> {
+        Ok((0, 0))
+    }
+    pub fn send_frame(&self, _data: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live raw capture not implemented on this platform",
+        ))
+    }
+}
+
 /// Unsupported placeholder for any other platform so the module compiles.
 #[cfg(not(any(
     target_os = "linux",
@@ -323,5 +512,19 @@ impl RawCapture {
 
     pub fn next_packet(&mut self) -> io::Result<Option<crate::savefile::PcapPacket>> {
         Ok(None)
+    }
+
+    pub fn set_direction(&mut self, _dir: Direction) {}
+    pub fn set_nonblock(&mut self, _nb: bool) -> io::Result<()> {
+        Ok(())
+    }
+    pub fn poll_stats(&self) -> io::Result<(u64, u64)> {
+        Ok((0, 0))
+    }
+    pub fn send_frame(&self, _data: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live capture requires Npcap on this platform",
+        ))
     }
 }
