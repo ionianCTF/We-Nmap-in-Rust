@@ -87,6 +87,47 @@ impl Iod {
         })
     }
 
+    /// The numeric id of this IOD within its pool, mirroring `nsock_iod_id`.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Build an IOD wrapping an already-connected TCP stream (mirrors the
+    /// `iod_new2` path that adopts an existing socket).
+    pub fn from_tcp_stream(stream: TcpStream, id: u64) -> Iod {
+        let _ = stream.set_nonblocking(true);
+        let peer = stream.peer_addr().ok();
+        Iod {
+            id,
+            tcp: Some(stream),
+            udp: None,
+            kind: IodKind::Tcp,
+            peer,
+            hostname: None,
+            read_count: 0,
+            write_count: 0,
+            connected: peer.is_some(),
+            udata: 0,
+        }
+    }
+
+    /// Build a UDP IOD wrapping an existing socket (mirrors `iod_new2`).
+    pub fn from_udp_socket(sock: UdpSocket, id: u64) -> Iod {
+        let _ = sock.set_nonblocking(true);
+        Iod {
+            id,
+            tcp: None,
+            udp: Some(sock),
+            kind: IodKind::Udp,
+            peer: None,
+            hostname: None,
+            read_count: 0,
+            write_count: 0,
+            connected: false,
+            udata: 0,
+        }
+    }
+
     /// The raw OS socket descriptor, if valid (mirrors `nsock_iod_get_sd`).
     #[cfg(unix)]
     pub fn fd(&self) -> i32 {

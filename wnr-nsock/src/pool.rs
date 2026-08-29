@@ -40,6 +40,8 @@ struct Pending {
     wbuf: Option<Vec<u8>>,
     /// Requested quantity for readbytes.
     target: usize,
+    /// When true, a Read completes as soon as a `\n` appears (readlines).
+    line_read: bool,
     cancelled: bool,
     done: bool,
 }
@@ -55,6 +57,9 @@ pub struct Pool {
     event_counter: u64,
     iods: HashMap<u64, Iod>,
     pending: HashMap<u64, Pending>,
+    /// Read buffers retained after a Read event is delivered, so callers can
+    /// fetch the accumulated bytes via `take_read_buf` after the loop returns.
+    read_bufs: HashMap<EventId, Vec<u8>>,
     tx: Sender<Cmd>,
     rx: Receiver<Cmd>,
     quit: bool,
@@ -77,6 +82,7 @@ impl Pool {
             event_counter: 0,
             iods: HashMap::new(),
             pending: HashMap::new(),
+            read_bufs: HashMap::new(),
             tx,
             rx,
             quit: false,
@@ -158,6 +164,7 @@ impl Pool {
                 buf: Vec::new(),
                 wbuf: None,
                 target: 0,
+                line_read: false,
                 cancelled: false,
                 done: false,
             },
@@ -207,6 +214,7 @@ impl Pool {
                 buf: Vec::new(),
                 wbuf: None,
                 target: 1,
+                line_read: false,
                 cancelled: false,
                 done: false,
             },
@@ -234,11 +242,156 @@ impl Pool {
                 buf: Vec::new(),
                 wbuf: None,
                 target: nbytes.max(1),
+                line_read: false,
                 cancelled: false,
                 done: false,
             },
         );
         id
+    }
+
+    /// Request an asynchronous read of one line, mirroring `nsock_readlines`.
+    ///
+    /// Bytes accumulate in the event's read buffer until a `\n` is seen (or the
+    /// timeout / EOF occurs). On success the handler fires with
+    /// [`EventStatus::Success`] and the line (including the trailing `\n`) can
+    /// be fetched with [`Pool::take_read_buf`]. `maxline` bounds how many bytes
+    /// may be accumulated before completing.
+    pub fn readlines(
+        &mut self,
+        iod_id: u64,
+        timeout_ms: i32,
+        maxline: usize,
+        handler: Handler,
+    ) -> EventId {
+        let deadline = if timeout_ms < 0 {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+        };
+        self.event_counter += 1;
+        let id = self.event_counter;
+        self.pending.insert(
+            id,
+            Pending {
+                id,
+                iod: Some(iod_id),
+                kind: EventType::Read,
+                handler,
+                deadline,
+                buf: Vec::new(),
+                wbuf: None,
+                target: maxline.max(1),
+                line_read: true,
+                cancelled: false,
+                done: false,
+            },
+        );
+        id
+    }
+
+    /// Async write of a formatted string, mirroring a printf-style
+    /// `nsock_write`. `args` is typically built with [`std::format_args`].
+    pub fn write_fmt(
+        &mut self,
+        iod_id: u64,
+        args: std::fmt::Arguments<'_>,
+        timeout_ms: i32,
+        handler: Handler,
+    ) -> EventId {
+        let s = format!("{}", args);
+        self.write(iod_id, s.as_bytes(), timeout_ms, handler)
+    }
+
+    /// Async write of a literal string, mirroring `nsock_write`.
+    pub fn printf(
+        &mut self,
+        iod_id: u64,
+        text: &str,
+        timeout_ms: i32,
+        handler: Handler,
+    ) -> EventId {
+        self.write(iod_id, text.as_bytes(), timeout_ms, handler)
+    }
+
+    /// Send a UDP datagram to `addr`, mirroring `nsock_send_udp`. The IOD is
+    /// (re)associated with `addr` and a Write event is scheduled.
+    pub fn send_udp(
+        &mut self,
+        iod_id: u64,
+        addr: SocketAddr,
+        data: &[u8],
+        timeout_ms: i32,
+        handler: Handler,
+    ) -> EventId {
+        let _ = self.connect_udp(iod_id, addr);
+        self.write(iod_id, data, timeout_ms, handler)
+    }
+
+    /// Create a TCP IOD wrapping an already-connected stream (mirrors
+    /// `nsock_iod_new2` adopting an existing socket).
+    pub fn create_iod_tcp_from(&mut self, stream: TcpStream) -> u64 {
+        self.iod_counter += 1;
+        let id = self.iod_counter;
+        let iod = Iod::from_tcp_stream(stream, id);
+        self.iods.insert(id, iod);
+        id
+    }
+
+    /// Create a UDP IOD wrapping an existing socket (mirrors `nsock_iod_new2`).
+    pub fn create_iod_udp_from(&mut self, sock: std::net::UdpSocket) -> u64 {
+        self.iod_counter += 1;
+        let id = self.iod_counter;
+        let iod = Iod::from_udp_socket(sock, id);
+        self.iods.insert(id, iod);
+        id
+    }
+
+    /// Delete an IOD and kill any of its pending events, mirroring
+    /// `nsock_iod_delete`. Their handlers fire with [`EventStatus::Kill`].
+    /// Returns whether an IOD with that id existed.
+    pub fn delete_iod(&mut self, id: u64) -> bool {
+        let ev_ids: Vec<EventId> = self
+            .pending
+            .iter()
+            .filter(|(_, e)| e.iod == Some(id))
+            .map(|(k, _)| *k)
+            .collect();
+        for evid in ev_ids {
+            if let Some(e) = self.pending.get_mut(&evid) {
+                if !e.done && !e.cancelled {
+                    e.done = true;
+                    let mut h = std::mem::replace(&mut e.handler, Box::new(|_, _| {}));
+                    h(evid, EventStatus::Kill);
+                }
+            }
+            self.read_bufs.remove(&evid);
+            self.pending.remove(&evid);
+        }
+        self.iods.remove(&id).is_some()
+    }
+
+    /// Destroy the pool, killing every pending event and clearing all IODs,
+    /// mirroring `nsock_pool_delete`. Existing event handlers fire with
+    /// [`EventStatus::Kill`].
+    pub fn delete(&mut self) {
+        let iod_ids: Vec<u64> = self.iods.keys().copied().collect();
+        for id in iod_ids {
+            self.delete_iod(id);
+        }
+        let ev_ids: Vec<EventId> = self.pending.keys().copied().collect();
+        for id in ev_ids {
+            if let Some(e) = self.pending.get_mut(&id) {
+                if !e.done && !e.cancelled {
+                    e.done = true;
+                    let mut h = std::mem::replace(&mut e.handler, Box::new(|_, _| {}));
+                    h(id, EventStatus::Kill);
+                }
+            }
+            self.read_bufs.remove(&id);
+            self.pending.remove(&id);
+        }
+        self.quit = true;
     }
 
     /// Request an async write, mirroring `nsock_write`.
@@ -267,6 +420,7 @@ impl Pool {
                 buf: Vec::new(),
                 wbuf: Some(data.to_vec()),
                 target: data.len(),
+                line_read: false,
                 cancelled: false,
                 done: false,
             },
@@ -289,6 +443,7 @@ impl Pool {
                 buf: Vec::new(),
                 wbuf: None,
                 target: 0,
+                line_read: false,
                 cancelled: false,
                 done: false,
             },
@@ -327,7 +482,11 @@ impl Pool {
     }
 
     /// The data accumulated by a completed Read event (mirrors `nse_readbuf`).
+    /// Buffers of delivered Read events are retained until consumed here.
     pub fn take_read_buf(&mut self, id: EventId) -> Vec<u8> {
+        if let Some(b) = self.read_bufs.remove(&id) {
+            return b;
+        }
         self.pending
             .get(&id)
             .map(|e| e.buf.clone())
@@ -401,6 +560,10 @@ impl Pool {
                 if let Some(e) = self.pending.get_mut(&id) {
                     if e.done || e.cancelled {
                         continue;
+                    }
+                    // Retain the accumulated read buffer for `take_read_buf`.
+                    if e.kind == EventType::Read {
+                        self.read_bufs.insert(id, std::mem::take(&mut e.buf));
                     }
                     e.done = true;
                     let mut handler = std::mem::replace(&mut e.handler, Box::new(|_, _| {}));
@@ -497,8 +660,15 @@ impl Pool {
                             e.buf.extend_from_slice(&b[..n]);
                         }
                         iod.read_count += n as u64;
+                        let line_read = self.pending[&id].line_read;
                         let target = self.pending[&id].target;
-                        if self.pending[&id].buf.len() >= target {
+                        let complete = if line_read {
+                            self.pending[&id].buf.contains(&b'\n')
+                                || self.pending[&id].buf.len() >= target
+                        } else {
+                            self.pending[&id].buf.len() >= target
+                        };
+                        if complete {
                             Some(EventStatus::Success)
                         } else {
                             None
