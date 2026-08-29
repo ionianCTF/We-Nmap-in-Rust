@@ -13,6 +13,7 @@
 //! * [`eth`] — Ethernet link-layer header / MAC address handling
 //! * [`intf`] — network interface enumeration (`struct intf_entry`)
 //! * [`arp`] — ARP message structures and cache
+//! * [`route`] — routing table operations (`struct route_entry`)
 //!
 //! # Example
 //!
@@ -29,6 +30,7 @@ pub mod addr;
 pub mod arp;
 pub mod eth;
 pub mod intf;
+pub mod route;
 
 pub use addr::Addr;
 pub use eth::EthAddr;
@@ -36,3 +38,4 @@ pub use intf::{
     IntfEntry, interface_by_name, interface_list, intf_set, source_addr_for_dest,
     source_addr_for_family,
 };
+pub use route::{RouteEntry, RouteTable, route_add, route_delete, route_to};
