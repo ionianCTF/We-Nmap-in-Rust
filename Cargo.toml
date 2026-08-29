@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "wnr-dnet",
+    "wnr-pcap",
+    "wnr-nsock",
+    "wnr",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+authors = ["ionianCTF"]
+
+[workspace.dependencies]
+wnr-dnet = { path = "wnr-dnet", version = "0.1.0" }
+wnr-pcap = { path = "wnr-pcap", version = "0.1.0" }
+wnr-nsock = { path = "wnr-nsock", version = "0.1.0" }
+
+[profile.release]
+lto = true

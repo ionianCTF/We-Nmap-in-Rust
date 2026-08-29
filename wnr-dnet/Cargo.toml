@@ -1,0 +1,20 @@
+[package]
+name = "wnr-dnet"
+description = "WNR: low-level raw networking library (libdnet port). Interface enumeration and link-layer hardware address handling."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Memory",
+] }
+
+[dev-dependencies]

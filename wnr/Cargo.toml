@@ -1,0 +1,17 @@
+[package]
+name = "wnr"
+description = "WNR: a from-scratch nmap reimplementation in Rust (CLI)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wnr"
+path = "src/main.rs"
+
+[dependencies]
+wnr-dnet = { workspace = true }
+wnr-pcap = { workspace = true }
+wnr-nsock = { workspace = true }
+
+[dev-dependencies]

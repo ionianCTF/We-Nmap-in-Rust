@@ -1,0 +1,15 @@
+[package]
+name = "wnr-nsock"
+description = "WNR: asynchronous network I/O sockets library (Nsock port). Event-driven, non-blocking socket handling."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wnr-pcap = { workspace = true, optional = true }
+
+[features]
+default = ["pcap"]
+pcap = ["dep:wnr-pcap"]
+
+[dev-dependencies]
