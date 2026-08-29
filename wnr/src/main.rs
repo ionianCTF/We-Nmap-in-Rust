@@ -139,20 +139,37 @@ fn cmd_scan(args: &[String]) {
 
     let mut pool = Pool::new(0);
     let total_ports = ports.len();
+    let open = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let closed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let started = std::time::Instant::now();
 
     for port in ports {
         let addr = SocketAddr::new(addrs[0].ip(), port);
         let iod = pool.create_iod_tcp();
+        let open = open.clone();
+        let closed = closed.clone();
         pool.connect_tcp(iod, addr, timeout_ms, Box::new(move |_, status| {
             match status {
-                EventStatus::Success => println!("{:>5}/tcp open", port),
-                _ => println!("{:>5}/tcp closed", port),
+                EventStatus::Success => {
+                    open.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    println!("{:>5}/tcp open", port);
+                }
+                _ => {
+                    closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    println!("{:>5}/tcp closed", port);
+                }
             }
         }));
     }
 
     pool.run(-1);
-    println!("done ({} ports scanned)", total_ports);
+    let elapsed = started.elapsed();
+    let open_n = open.load(std::sync::atomic::Ordering::SeqCst);
+    let closed_n = closed.load(std::sync::atomic::Ordering::SeqCst);
+    println!(
+        "WNR done: {} host(s) scanned ({}/{} port(s) responded: {} open, {} closed) in {:.1?}",
+        host, open_n + closed_n, total_ports, open_n, closed_n, elapsed
+    );
 }
 
 fn cmd_pcap(args: &[String]) {
@@ -265,6 +282,7 @@ fn resolve_ip(host: &str) -> Option<std::net::IpAddr> {
 }
 
 fn parse_ports(spec: &str) -> Vec<u16> {
+    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for part in spec.split(',') {
         if part.contains('-') {
@@ -272,10 +290,14 @@ fn parse_ports(spec: &str) -> Vec<u16> {
             let a: u16 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
             let b: u16 = it.next().and_then(|v| v.parse().ok()).unwrap_or(a);
             for p in a..=b.max(a) {
-                out.push(p);
+                if seen.insert(p) {
+                    out.push(p);
+                }
             }
         } else if let Ok(p) = part.parse() {
-            out.push(p);
+            if seen.insert(p) {
+                out.push(p);
+            }
         }
     }
     out
@@ -300,6 +322,13 @@ mod tests {
     #[test]
     fn parse_single_is_treated_as_range_of_one() {
         assert_eq!(parse_ports("5-5"), vec![5]);
+    }
+
+    #[test]
+    fn parse_dedups_overlapping_ranges() {
+        // 1-5 overlaps 3-7; 80 appears twice; the result must contain each
+        // port exactly once, in first-seen order.
+        assert_eq!(parse_ports("1-5,3-7,80,80"), vec![1, 2, 3, 4, 5, 6, 7, 80]);
     }
 
     #[test]
