@@ -14,6 +14,7 @@
 //! * [`capture`] — `Capture` handle (live + offline) and device enumeration
 //! * [`savefile`] — reading/writing pcap savefiles
 //! * [`raw`] — low-level raw-socket live-capture backend (Unix)
+//! * [`sendqueue`] — packet transmission queue (`pcap_sendqueue_*`)
 //!
 //! # Example
 //!
@@ -33,9 +34,11 @@ pub mod capture;
 pub mod datalink;
 pub mod raw;
 pub mod savefile;
+pub mod sendqueue;
 
 pub use capture::{
     Capture, CaptureStats, Device, LoopControl, PacketHeader, findalldevs, lib_version, lookupdev,
     read_all,
 };
 pub use raw::Direction;
+pub use sendqueue::Sendqueue;

@@ -346,6 +346,21 @@ impl Capture {
         }
     }
 
+    /// Transmit every packet in `queue`, mirroring `pcap_sendqueue_transmit`.
+    ///
+    /// Each packet's frame bytes are injected onto the wire in queue order.
+    /// Only supported on live captures (each injection goes through
+    /// [`Capture::inject`], so an offline capture fails immediately). Returns
+    /// the total number of bytes transmitted.
+    pub fn transmit_sendqueue(&mut self, queue: &crate::sendqueue::Sendqueue) -> Result<u32, String> {
+        let mut total: u32 = 0;
+        for pkt in queue.entries() {
+            let n = self.inject(&pkt.data)?;
+            total += n as u32;
+        }
+        Ok(total)
+    }
+
     /// Process up to `count` packets from a live/offline capture, mirroring
     /// `pcap_loop`. `count == 0` means "until break / end of capture".
     /// Returns the number of packets processed.
@@ -490,6 +505,20 @@ mod tests {
     #[test]
     fn lib_version_present() {
         assert!(lib_version().starts_with("wnr-pcap "));
+    }
+
+    #[test]
+    fn transmit_sendqueue_rejects_offline() {
+        let path = fixture();
+        let mut cap = Capture::open_offline(&path).unwrap();
+        let q = crate::sendqueue::Sendqueue::new(1024);
+        // Injecting onto an offline capture is unsupported, so transmitting
+        // a queued packet must fail (through pcap_inject).
+        assert!(cap.transmit_sendqueue(&q).is_ok()); // empty queue: nothing to send
+        let mut q2 = crate::sendqueue::Sendqueue::new(1024);
+        q2.add_raw(1, 0, vec![0x00, 0x11, 0x22]).unwrap();
+        assert!(cap.transmit_sendqueue(&q2).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
