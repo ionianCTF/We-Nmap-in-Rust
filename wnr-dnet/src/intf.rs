@@ -82,6 +82,89 @@ pub fn interface_list() -> Vec<IntfEntry> {
     }
 }
 
+/// Look up a single interface entry by name — mirrors libdnet's `intf_get`.
+///
+/// Returns `None` if no interface with that name exists.
+pub fn interface_by_name(name: &str) -> Option<IntfEntry> {
+    interface_list().into_iter().find(|e| e.name == name)
+}
+
+/// Determine the local source address the kernel would use to reach `dest`,
+/// without sending any packets — mirrors libdnet's `intf_get_dst(dst, src)`.
+///
+/// This binds an ephemeral datagram socket, `connect()`s to `dest` (which
+/// triggers route lookup and local address assignment), then reads back the
+/// bound local address. Works without special privileges.
+pub fn source_addr_for_dest(dest: &Addr) -> Option<Addr> {
+    let sa = addr_to_sockaddr(dest)?;
+    let socket = match sa {
+        std::net::SocketAddr::V4(_) => std::net::UdpSocket::bind("0.0.0.0:0").ok()?,
+        std::net::SocketAddr::V6(_) => std::net::UdpSocket::bind("[::]:0").ok()?,
+    };
+    socket.connect(sa).ok()?;
+    let local = socket.local_addr().ok()?;
+    Some(sockaddr_to_addr(&local))
+}
+
+/// Determine the local source address the kernel would use to reach the
+/// default route for a given address family — mirrors libdnet's
+/// `intf_get_src(family, src)`.
+///
+/// `family` uses the POSIX `AF_*` constants: `AF_INET` = 2 and
+/// `AF_INET6` = 10. The libdnet reference connects toward the broadcast
+/// address (`255.255.255.255`) / all-nodes multicast (`ff01::1`) to select the
+/// default-route interface; we mirror that behaviour.
+pub fn source_addr_for_family(family: u16) -> Option<Addr> {
+    use crate::addr::{ADDR_TYPE_IP, ADDR_TYPE_IP6};
+    let (ty, dst) = match family {
+        2 => (ADDR_TYPE_IP, "255.255.255.255"),
+        10 | 23 => (ADDR_TYPE_IP6, "ff01::1"),
+        _ => return None,
+    };
+    let dest: Addr = dst.parse().ok()?;
+    debug_assert_eq!(dest.addr_type, ty);
+    source_addr_for_dest(&dest)
+}
+
+/// Set attributes on an interface — mirrors libdnet's `intf_set(entry)`.
+///
+/// Reconfiguring a live interface (changing its MTU, flags, or IP address)
+/// requires elevated privileges (root on Unix, Administrator on Windows).
+/// This implementation validates the supplied entry and reports that the
+/// mutation itself needs those privileges rather than pretending to succeed.
+pub fn intf_set(entry: &IntfEntry) -> Result<(), String> {
+    if entry.name.is_empty() {
+        return Err("intf_set: empty interface name".to_string());
+    }
+    if !interface_by_name(&entry.name).is_some() {
+        return Err(format!("intf_set: no such interface '{}'", entry.name));
+    }
+    Err(
+        "intf_set: applying interface configuration (MTU/flags/address) requires \
+         elevated privileges; set them via the OS instead"
+            .to_string(),
+    )
+}
+
+/// Convert an [`Addr`] to a `SocketAddr` with an arbitrary discard port.
+fn addr_to_sockaddr(a: &Addr) -> Option<std::net::SocketAddr> {
+    use crate::addr::{ADDR_TYPE_IP, ADDR_TYPE_IP6};
+    use std::net::{IpAddr, SocketAddr};
+    match a.addr_type {
+        ADDR_TYPE_IP => a.to_ipv4().map(|ip| SocketAddr::new(IpAddr::V4(ip), 9)),
+        ADDR_TYPE_IP6 => a.to_ipv6().map(|ip| SocketAddr::new(IpAddr::V6(ip), 9)),
+        _ => None,
+    }
+}
+
+/// Convert a `SocketAddr` back to an [`Addr`], dropping the port.
+fn sockaddr_to_addr(sa: &std::net::SocketAddr) -> Addr {
+    match sa {
+        std::net::SocketAddr::V4(v4) => Addr::ipv4(*v4.ip()),
+        std::net::SocketAddr::V6(v6) => Addr::ipv6(*v6.ip()),
+    }
+}
+
 #[cfg(windows)]
 fn windows_interfaces() -> Vec<IntfEntry> {
     use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
@@ -345,5 +428,33 @@ mod tests {
         assert_eq!(INTF_TYPE_ETH, 6);
         assert_eq!(INTF_TYPE_LOOPBACK, 24);
         assert_eq!(INTF_FLAG_UP, 0x01);
+    }
+
+    #[test]
+    fn sockaddr_roundtrip() {
+        let a = Addr::ipv4(std::net::Ipv4Addr::new(192, 168, 1, 5));
+        let sa = addr_to_sockaddr(&a).expect("v4 addr should convert");
+        assert_eq!(sa.port(), 9);
+        assert_eq!(
+            sockaddr_to_addr(&sa).to_ipv4().unwrap(),
+            std::net::Ipv4Addr::new(192, 168, 1, 5)
+        );
+
+        let a6 = Addr::ipv6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        let sa6 = addr_to_sockaddr(&a6).expect("v6 addr should convert");
+        assert_eq!(sockaddr_to_addr(&sa6).to_ipv6().unwrap(), a6.to_ipv6().unwrap());
+    }
+
+    #[test]
+    fn bad_family_rejected() {
+        assert!(source_addr_for_family(0).is_none());
+        assert!(source_addr_for_family(99).is_none());
+    }
+
+    #[test]
+    fn intf_set_requires_real_iface() {
+        // Empty name is rejected before any privilege handling.
+        let e = IntfEntry::default();
+        assert!(intf_set(&e).is_err());
     }
 }

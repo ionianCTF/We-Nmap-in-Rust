@@ -32,4 +32,7 @@ pub mod intf;
 
 pub use addr::Addr;
 pub use eth::EthAddr;
-pub use intf::{IntfEntry, interface_list};
+pub use intf::{
+    IntfEntry, interface_by_name, interface_list, intf_set, source_addr_for_dest,
+    source_addr_for_family,
+};
